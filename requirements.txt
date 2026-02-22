@@ -15,5 +15,5 @@ aiofiles==22.1.0
 # Scheduler
 apscheduler==3.10.1
 
-# Configuration
 environs==9.5.0
+marshmallow>=3.13,<4
