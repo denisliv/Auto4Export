@@ -11,6 +11,7 @@ from aiogram import Bot
 from aiogram.exceptions import (
     TelegramBadRequest,
     TelegramForbiddenError,
+    TelegramNetworkError,
     TelegramRetryAfter,
 )
 from aiogram.types import InputMediaPhoto
@@ -339,6 +340,19 @@ async def subscription_sender(sessionmaker: AsyncSession, bot: Bot):
                         )
                     )
                     number += 1
+                except TelegramNetworkError:
+                    await asyncio.sleep(5)
+                    try:
+                        await bot.send_media_group(tg_id, media=media_group)
+                        data_buttons.append(
+                            (
+                                f"✅ Авто № {number}",
+                                f"Лот №: {car[0]['Lot number']}-{car[0]['Make']}-{car[0]['Model Detail']}",
+                            )
+                        )
+                        number += 1
+                    except Exception:
+                        continue
                 except TelegramForbiddenError:
                     await methods.delete_user(session, tg_id)
                     continue

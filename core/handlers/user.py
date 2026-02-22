@@ -1,7 +1,11 @@
 import asyncio
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+)
 from aiogram.filters import Command, StateFilter, Text
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
@@ -289,6 +293,19 @@ async def process_result_true_press(
                     )
                 )
                 number += 1
+            except TelegramNetworkError:
+                await asyncio.sleep(5)
+                try:
+                    await callback.message.answer_media_group(media=media_group)
+                    data_buttons.append(
+                        (
+                            f"✅ Авто № {number}",
+                            f"Лот №: {car[0]['Lot number']}-{car[0]['Make']}-{car[0]['Model Detail']}",
+                        )
+                    )
+                    number += 1
+                except Exception:
+                    continue
             except TelegramBadRequest:
                 continue
             else:
@@ -348,6 +365,19 @@ async def process_else_press(callback: CallbackQuery, state: FSMContext):
                 )
             )
             number += 1
+        except TelegramNetworkError:
+            await asyncio.sleep(5)
+            try:
+                await callback.message.answer_media_group(media=media_group)
+                old_data_buttons.append(
+                    (
+                        f"✅ Авто № {number}",
+                        f"Лот №: {car[0]['Lot number']}-{car[0]['Make']}-{car[0]['Model Detail']}",
+                    )
+                )
+                number += 1
+            except Exception:
+                continue
         except TelegramBadRequest:
             continue
         else:
