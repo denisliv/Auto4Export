@@ -25,15 +25,41 @@ PGPASSWORD=2064 pg_dump -U postgres -h localhost -d auto4export -F p -f auto4exp
 
 ---
 
-## 2. Загрузка дампа на новый сервер
+## 2. Перенос дампа на новый сервер
+
+Сервера у разных провайдеров в разных странах — прямой `scp` между ними часто не работает (файрволы, SSH). Используйте один из способов ниже.
+
+### Вариант А: Через ваш компьютер (универсально)
+
+1. **Скачать дамп со старого сервера на ваш ПК**
+
+   В PowerShell или терминале (на Windows можно использовать PuTTY/pscp или встроенный `scp`):
+   ```bash
+   scp user@old-server-ip:/path/to/auto4export_dump.sql ./
+   ```
+   Или через **WinSCP** / **FileZilla** (SFTP): подключитесь к старому серверу и скачайте `auto4export_dump.sql`.
+
+2. **Загрузить дамп с вашего ПК на новый сервер**
+
+   ```bash
+   scp ./auto4export_dump.sql user@new-server-ip:/path/to/Auto4Export/backups/
+   ```
+   Или через WinSCP/FileZilla: подключитесь к новому серверу и загрузите файл в `Auto4Export/backups/`.
+
+### Вариант Б: Прямо между серверами (если SSH открыт)
+
+**На старом сервере**, если с него есть доступ к новому:
 
 ```bash
-# Через scp
-scp auto4export_dump.sql user@new-server:/path/to/Auto4Export/backups/
-
-# Или через rsync
-rsync -avz auto4export_dump.sql user@new-server:/path/to/Auto4Export/backups/
+scp auto4export_dump.sql user@new-server-ip:/path/to/Auto4Export/backups/
 ```
+
+Если не подключается — используйте вариант А.
+
+### Вариант В: Через облако (для больших дампов)
+
+1. **На старом сервере** — загрузить в S3, Google Drive, Dropbox и т.п. (curl, rclone, web-интерфейс).
+2. **На новом сервере** — скачать файл оттуда (wget, curl, rclone).
 
 ---
 

@@ -24,8 +24,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-auto4export}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      # Optional: mount dump for initial load (see MIGRATION.md)
-      # - ./backups/auto4export.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # Раскомментировать при первом запуске для загрузки дампа, затем закомментировать снова (см. MIGRATION.md)
+      - ./backups/auto4export_dump_v2.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-auto4export}"]
       interval: 5s
