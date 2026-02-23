@@ -56,13 +56,19 @@ async def get_images(car: dict) -> list:
     async with aiohttp.ClientSession() as session:
         try:
             response = await fetch_json(session, url)
-            image_count = int(response["imgCount"])
-            for i in range(image_count):
-                links = response["lotImages"][i]["link"]
+            # Итерируем по фактическому массиву lotImages, а не по imgCount,
+            # т.к. imgCount может быть больше длины lotImages (несогласованность API)
+            lot_images = response.get("lotImages", [])
+            for image_data in lot_images:
+                links = image_data.get("link", [])
+                if not isinstance(links, list):
+                    links = [links] if links else []
                 for link in links:
-                    if link["isHdImage"] is True:
-                        urls.append(link["url"].strip())
-        except (ContentTypeError, KeyError):
+                    if isinstance(link, dict) and link.get("isHdImage") is True:
+                        url_str = link.get("url", "").strip()
+                        if url_str:
+                            urls.append(url_str)
+        except (ContentTypeError, KeyError, IndexError):
             print(f"Изображения не найдены: {url}")
     return urls[0:9]
 
