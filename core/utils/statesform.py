@@ -30,6 +30,7 @@ class FSMAdminForm(StatesGroup):
     get_button = State()
     get_button_text = State()
     get_button_url = State()
+    get_button_message_text = State()
 
 
 class FSMPhoneForm(StatesGroup):
