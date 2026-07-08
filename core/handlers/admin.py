@@ -108,9 +108,11 @@ async def _process_album_after_delay(
         return
 
     sorted_msgs = sorted(messages, key=lambda m: m.message_id)
+    # Подпись может прийти с любым сообщением альбома, не только с первым
+    album_caption = next((m.caption for m in sorted_msgs if m.caption), None)
     media_items = []
     for i, m in enumerate(sorted_msgs):
-        caption = m.caption if i == 0 else None
+        caption = album_caption if i == 0 else None
         if m.photo:
             media_items.append(
                 {"type": "photo", "file_id": m.photo[-1].file_id, "caption": caption}
