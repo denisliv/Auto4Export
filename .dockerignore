@@ -3,6 +3,7 @@ __pycache__
 *.pyc
 .git
 .env
+backups/
 *.md
 !MIGRATION.md
 .idea
