@@ -1,7 +1,7 @@
-from datetime import date, datetime
+from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import MetaData, delete, func, select, update
+from sqlalchemy import MetaData, delete, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.orm import Query
 from sqlalchemy.sql import text
