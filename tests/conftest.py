@@ -16,6 +16,7 @@ os.environ.setdefault("ADMIN_IDS", "1")
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@127.0.0.1:1/test")
 os.environ.setdefault("REDIS_URL", "redis://127.0.0.1:1/0")
 os.environ.setdefault("COPART_URL", "https://feed.invalid/salesdata.cgi?authKey=test")
+os.environ.setdefault("BITRIX_WEBHOOK_URL", "https://portal.invalid/rest/1/not-a-real-token/")
 
 from sqlalchemy.ext.asyncio import create_async_engine  # noqa: E402
 

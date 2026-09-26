@@ -23,6 +23,7 @@ from aiohttp.client_exceptions import ContentTypeError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.orm import Query
 
+from core.config_data.config import load_config
 from core.db import methods, sales_lots
 from core.keyboards.keyboard_inline import create_sub_auto_keyboard
 from core.lexicon.lexicon_ru import (
@@ -51,6 +52,13 @@ IMAGE_LOOKUP_CHUNK = 12
 ALL_MODELS_NORM = "ALLMODELS"
 
 HTTP_OK = 200
+
+# Входящий вебхук Bitrix24 для создания лидов. Секрет: живёт только в .env,
+# в код и в git не попадает. Хвостовой слэш допускается — так Bitrix его и
+# показывает при выпуске вебхука.
+BITRIX_LEAD_ADD_URL = (
+    f"{load_config().tg_bot.bitrix_webhook_url.rstrip('/')}/crm.lead.add.json"
+)
 
 
 class FeedDownloadError(Exception):
@@ -510,7 +518,7 @@ async def make_bitrix_url(tg_login: str, tg_id: int, data: dict, method: str) ->
         buytime = quote(str(data.get("buytime", "")), safe="")
 
         url = (
-            f"https://intertrade.bitrix24.by/rest/61/jfx53ycydgyyr39c/crm.lead.add.json?"
+            f"{BITRIX_LEAD_ADD_URL}?"
             f"FIELDS[TITLE]=Консультация (TgBot)&"
             f"FIELDS[NAME]={name}&"
             f"FIELDS[PHONE][0][VALUE]={data.get('phone')}&"
@@ -530,7 +538,7 @@ async def make_bitrix_url(tg_login: str, tg_id: int, data: dict, method: str) ->
         year = quote(str(data.get("year", "")), safe="")
 
         url = (
-            f"https://intertrade.bitrix24.by/rest/61/jfx53ycydgyyr39c/crm.lead.add.json?"
+            f"{BITRIX_LEAD_ADD_URL}?"
             f"FIELDS[TITLE]={model} (TgBot)&"
             f"FIELDS[NAME]={name}&"
             f"FIELDS[PHONE][0][VALUE]={data.get('phone')}&"
@@ -552,7 +560,7 @@ async def make_bitrix_url(tg_login: str, tg_id: int, data: dict, method: str) ->
         title = quote(f"{make} {model} (TgBot)", safe="")
 
         url = (
-            f"https://intertrade.bitrix24.by/rest/61/jfx53ycydgyyr39c/crm.lead.add.json?"
+            f"{BITRIX_LEAD_ADD_URL}?"
             f"FIELDS[TITLE]={title}&"
             f"FIELDS[NAME]={name}&"
             f"FIELDS[PHONE][0][VALUE]={data.get('phone')}&"
@@ -568,7 +576,7 @@ async def make_bitrix_url(tg_login: str, tg_id: int, data: dict, method: str) ->
         name = quote(data.get("name", ""), safe="")
         encoded_message = quote(data.get("message", ""), safe="")
         url = (
-            f"https://intertrade.bitrix24.by/rest/61/jfx53ycydgyyr39c/crm.lead.add.json?"
+            f"{BITRIX_LEAD_ADD_URL}?"
             f"FIELDS[TITLE]=Сообщение TgBot (A4E)&"
             f"FIELDS[NAME]={name}&"
             f"FIELDS[PHONE][0][VALUE]={data.get('phone')}&"
