@@ -1,7 +1,7 @@
 from datetime import datetime
 
-from sqlalchemy import (ARRAY, BigInteger, Column, DateTime, ForeignKey,
-                        Integer, String)
+from sqlalchemy import (ARRAY, BigInteger, Column, DateTime, Float, ForeignKey,
+                        Index, Integer, String)
 from sqlalchemy.orm import relationship
 
 from core.db.base import Base
@@ -77,6 +77,39 @@ class DamagedCarOrders(Base):
 
     def __repr__(self):
         return str(self.tg_id)
+
+
+# Снимок инвентаря Copart. Раньше каждый поиск читал весь CSV (~90 МБ) в память
+# целиком; теперь выборка идёт запросом, и в процесс попадают только кандидаты.
+class SalesLot(Base):
+    __tablename__ = 'sales_lot'
+
+    id = Column(Integer, primary_key=True)
+    # Значения CSV дословно: подпись к фото печатает год, пробег и дату торгов
+    # как есть и режет строку двигателя, так что разобранное число изменило бы
+    # то, что видит клиент.
+    make = Column(String)
+    model_group = Column(String)
+    model_detail = Column(String)
+    year_text = Column(String)
+    odometer_text = Column(String)
+    sale_date = Column(String)
+    lot_number = Column(String)
+    vin = Column(String)
+    color = Column(String)
+    engine = Column(String)
+    drive = Column(String)
+    transmission = Column(String)
+    fuel_type = Column(String)
+    damage_description = Column(String)
+    image_url = Column(String)
+    # Разобранные значения — только для фильтрации, наружу не уходят.
+    make_norm = Column(String, nullable=False)
+    model_norm = Column(String, nullable=False)
+    year = Column(Integer, nullable=False)
+    odometer = Column(Float)
+
+    __table_args__ = (Index('idx_sales_lot_make_model', 'make_norm', 'model_norm'),)
 
 
 class AdminTable(Base):

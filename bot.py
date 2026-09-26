@@ -17,7 +17,11 @@ from core.middlewares import (
     ThrottlingMiddleware,
 )
 from core.services.admin_sevices import SenderList
-from core.services.services import download_csv, subscription_sender
+from core.services.services import (
+    download_csv,
+    ensure_snapshot_loaded,
+    subscription_sender,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +50,10 @@ async def main() -> None:
     dp.update.middleware(DbSessionMiddleware(session_pool=sessionmaker, engine=engine))
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
     scheduler.add_job(
-        download_csv, trigger="interval", minutes=30, kwargs={"url": copart_url}
+        download_csv,
+        trigger="interval",
+        minutes=30,
+        kwargs={"url": copart_url, "engine": engine},
     )
     scheduler.add_job(
         subscription_sender,
@@ -76,10 +83,16 @@ async def main() -> None:
     # Загрузка CSV при первом запуске (дальше обновляется по расписанию каждые 30 мин)
     logger.info("Downloading initial Copart CSV...")
     try:
-        await download_csv(url=copart_url)
+        await download_csv(url=copart_url, engine=engine)
         logger.info("Copart CSV downloaded successfully")
     except Exception as e:
         logger.warning(f"Initial CSV download failed (will retry in 30 min): {e}")
+
+    # Если Copart недоступен, а снимок в базе пуст, поднимаем его из файла на томе
+    try:
+        await ensure_snapshot_loaded(engine)
+    except Exception as e:
+        logger.warning(f"Snapshot could not be restored from the feed file: {e}")
 
     await dp.start_polling(bot, senderlist=sender_list)
 

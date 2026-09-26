@@ -1,7 +1,11 @@
 import asyncio
 import csv
-import random
+import logging
+import os
 import re
+from collections.abc import AsyncIterator, Iterator
+from itertools import islice
+from pathlib import Path
 from typing import List, Tuple
 from urllib.parse import quote
 
@@ -16,10 +20,10 @@ from aiogram.exceptions import (
 )
 from aiogram.types import InputMediaPhoto
 from aiohttp.client_exceptions import ContentTypeError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.orm import Query
 
-from core.db import methods
+from core.db import methods, sales_lots
 from core.keyboards.keyboard_inline import create_sub_auto_keyboard
 from core.lexicon.lexicon_ru import (
     LEXICON_CAPTION_RU,
@@ -27,6 +31,30 @@ from core.lexicon.lexicon_ru import (
     LEXICON_RU,
     LEXICON_RU_CSV,
 )
+
+logger = logging.getLogger(__name__)
+
+# Файл фида на томе csv_data: переживает пересоздание контейнера, поэтому из
+# него восстанавливается снимок, если база пуста, а Copart недоступен.
+CSV_PATH = Path("core/data/csv/salesdata.csv")
+CSV_ENCODING = "utf-8"
+# Размер куска при записи ответа Copart на диск.
+DOWNLOAD_CHUNK_BYTES = 1024
+# Предел на всю загрузку фида. Столько же aiohttp ставит по умолчанию; значение
+# вынесено явно, чтобы зависший CDN не держал задачу планировщика вечно.
+DOWNLOAD_TIMEOUT_SECONDS = 300
+# Сколько строк CSV разбирается за один заход в рабочем потоке при загрузке.
+SNAPSHOT_BATCH_ROWS = 5000
+# Сколько кандидатов подгружается из базы за раз, пока ищем лоты с фото.
+IMAGE_LOOKUP_CHUNK = 12
+# Так normalize_string записывает кнопку «все модели».
+ALL_MODELS_NORM = "ALLMODELS"
+
+HTTP_OK = 200
+
+
+class FeedDownloadError(Exception):
+    """The Copart feed answered with something that is not a usable snapshot."""
 
 
 # Функция нормализации строк для сравнения
@@ -73,187 +101,97 @@ async def get_images(car: dict) -> list:
     return urls[0:9]
 
 
-# Функция фильтр получения данных по марке, моделе, году из сsv
-async def filter_by_make_and_model(row, make, model, year):
+# Фильтры поиска из заявки клиента, в том виде, в каком их понимает снимок
+def _search_filters(order) -> dict:
+    """Translate one damaged-car order into snapshot filters.
+
+    Make and model are compared after `normalize_string`, the same function
+    that normalised the snapshot when it was loaded, so "FISKER" still finds
+    "FISKER AUTOMOTIVE". The "all models" button normalises to ALLMODELS and
+    lifts the model filter altogether.
+
+    Args:
+        order: A `DamagedCarOrders` row.
+
+    Returns:
+        Keyword arguments for `sales_lots.candidate_ids`.
     """
-    Фильтрует данные по марке, модели и году.
-    - Если model == "ALL_MODELS" или "ALL MODELS", то выбираются все модели марки
-    - Сравнение происходит после нормализации (верхний регистр, только буквы и цифры)
-    """
-    # Нормализуем значения из CSV
-    normalized_csv_make = normalize_string(row["Make"])
-    normalized_csv_model = normalize_string(row["Model Group"])
-
-    # Нормализуем значения от пользователя
-    normalized_make = normalize_string(make)
-    normalized_model = normalize_string(model)
-
-    # Проверяем марку
-    make_match = normalized_csv_make == normalized_make
-
-    # Проверяем модель: если выбрано "ALL_MODELS" или "ALL MODELS", пропускаем проверку модели
-    # После нормализации оба варианта становятся "ALLMODELS"
-    is_all_models = normalized_model == "ALLMODELS"
-    model_match = is_all_models or (normalized_csv_model == normalized_model)
-
-    # Проверяем год и дату продажи
-    if year is None:
-        # Если год не имеет значения, пропускаем проверку года
-        year_match = row["Sale Date M/D/CY"] != "0"
-    else:
-        try:
-            year_value = int(float(row["Year"])) if row.get("Year") else 0
-        except (ValueError, TypeError):
-            year_value = 0
-
-        year_match = year_value in year and row["Sale Date M/D/CY"] != "0"
-
-    return make_match and model_match and year_match
-
-
-# Функция получения данных из сsv для показа
-async def get_data(session: AsyncSession, tg_id: int, count: int = 6) -> List[Tuple]:
-    data = await methods.get_damaged_car(session, tg_id)
-    make = data.car_make
-    model = data.car_model
-    year = LEXICON_RU_CSV[data.car_year]
-    odometer = LEXICON_RU_CSV[data.car_odometer] if data.car_odometer else None
+    model_norm = normalize_string(order.car_model)
+    odometer = LEXICON_RU_CSV[order.car_odometer] if order.car_odometer else None
     description = (
-        LEXICON_RU_CSV[data.car_damage_description]
-        if data.car_damage_description
+        LEXICON_RU_CSV[order.car_damage_description]
+        if order.car_damage_description
         else None
     )
+    return {
+        "make_norm": normalize_string(order.car_make),
+        "model_norm": None if model_norm == ALL_MODELS_NORM else model_norm,
+        # None — «год не имеет значения»: проверяется только дата торгов.
+        "years": LEXICON_RU_CSV[order.car_year],
+        "odometer": odometer or None,
+        "description": description or None,
+    }
 
+
+# Кандидаты в случайном порядке, у которых нашлись фото
+async def _iter_cars_with_images(
+    session: AsyncSession, order, exclude_vins=()
+) -> AsyncIterator[Tuple[dict, list]]:
+    """Yield matching lots that have photos, in random order.
+
+    The same draw as before: every match in random order, checked for photos
+    one by one until the caller has enough. Only the ids of the matches are
+    held; rows are fetched a few at a time as the check reaches them.
+
+    Args:
+        session: Session to query through.
+        order: A `DamagedCarOrders` row.
+        exclude_vins: VINs this subscriber has already been sent.
+
+    Yields:
+        Pairs of row and its HD image URLs.
+    """
+    ids = await sales_lots.candidate_ids(
+        session, **_search_filters(order), exclude_vins=exclude_vins
+    )
+    for start in range(0, len(ids), IMAGE_LOOKUP_CHUNK):
+        rows = await sales_lots.rows_by_ids(
+            session, ids[start : start + IMAGE_LOOKUP_CHUNK]
+        )
+        for row in rows:
+            car_images_urls = await get_images(row)
+            if car_images_urls:
+                yield row, car_images_urls
+
+
+# Функция получения данных из снимка Copart для показа
+async def get_data(session: AsyncSession, tg_id: int, count: int = 6) -> List[Tuple]:
+    data = await methods.get_damaged_car(session, tg_id)
     cars = []
-    async with aiofiles.open("core/data/csv/salesdata.csv") as csvfile:
-        shuffled_list = []
-        csv_list = await csvfile.readlines()
-        shuffled_list.append(csv_list[0])
-        csv_list = csv_list[1:]
-        random.shuffle(csv_list)
-        shuffled_list.extend(csv_list)
-        reader = csv.DictReader(shuffled_list)
-        for row in reader:
-            if odometer and description:
-                if (
-                    await filter_by_make_and_model(row, make, model, year)
-                    and float(row["Odometer"]) >= odometer[0]
-                    and float(row["Odometer"]) <= odometer[1]
-                    and row["Damage Description"] == description
-                ):
-                    car_images_urls = await get_images(row)
-                    if car_images_urls:
-                        cars.append((row, car_images_urls))
-                        if len(cars) >= count:
-                            break
-            elif odometer:
-                if (
-                    await filter_by_make_and_model(row, make, model, year)
-                    and float(row["Odometer"]) >= odometer[0]
-                    and float(row["Odometer"]) <= odometer[1]
-                ):
-                    car_images_urls = await get_images(row)
-                    if car_images_urls:
-                        cars.append((row, car_images_urls))
-                        if len(cars) >= count:
-                            break
-            elif description:
-                if (
-                    await filter_by_make_and_model(row, make, model, year)
-                    and row["Damage Description"] == description
-                ):
-                    car_images_urls = await get_images(row)
-                    if car_images_urls:
-                        cars.append((row, car_images_urls))
-                        if len(cars) >= count:
-                            break
-            else:
-                if await filter_by_make_and_model(row, make, model, year):
-                    car_images_urls = await get_images(row)
-                    if car_images_urls:
-                        cars.append((row, car_images_urls))
-                        if len(cars) >= count:
-                            break
+    async for car in _iter_cars_with_images(session, data):
+        cars.append(car)
+        if len(cars) >= count:
+            break
     return cars[:count]
 
 
-# Функция получения данных из сsv для рассылки
+# Функция получения данных из снимка Copart для рассылки
 async def get_subscription_data(
     session: AsyncSession, data: Query = None, count: int = 3
 ) -> List[Tuple]:
-    make = data.car_make
-    model = data.car_model
-    year = LEXICON_RU_CSV[data.car_year]
-    odometer = LEXICON_RU_CSV[data.car_odometer] if data.car_odometer else None
-    description = (
-        LEXICON_RU_CSV[data.car_damage_description]
-        if data.car_damage_description
-        else None
-    )
     car_id = data.id
     car_vins = data.subscription_vins if data.subscription_vins else []
 
     cars = []
-    async with aiofiles.open("core/data/csv/salesdata.csv") as csvfile:
-        shuffled_list = []
-        csv_list = await csvfile.readlines()
-        shuffled_list.append(csv_list[0])
-        csv_list = csv_list[1:]
-        random.shuffle(csv_list)
-        shuffled_list.extend(csv_list)
-        reader = csv.DictReader(shuffled_list)
-        for row in reader:
-            if row["VIN"] in car_vins:
-                continue
-            else:
-                if odometer and description:
-                    if (
-                        await filter_by_make_and_model(row, make, model, year)
-                        and float(row["Odometer"]) >= odometer[0]
-                        and float(row["Odometer"]) <= odometer[1]
-                        and row["Damage Description"] == description
-                    ):
-                        car_images_urls = await get_images(row)
-                        if car_images_urls:
-                            cars.append((row, car_images_urls))
-                            car_vin = row["VIN"]
-                            await methods.add_vins(session, car_id, car_vin)
-                            if len(cars) >= count:
-                                break
-                elif odometer:
-                    if (
-                        await filter_by_make_and_model(row, make, model, year)
-                        and float(row["Odometer"]) >= odometer[0]
-                        and float(row["Odometer"]) <= odometer[1]
-                    ):
-                        car_images_urls = await get_images(row)
-                        if car_images_urls:
-                            cars.append((row, car_images_urls))
-                            car_vin = row["VIN"]
-                            await methods.add_vins(session, car_id, car_vin)
-                            if len(cars) >= count:
-                                break
-                elif description:
-                    if (
-                        await filter_by_make_and_model(row, make, model, year)
-                        and row["Damage Description"] == description
-                    ):
-                        car_images_urls = await get_images(row)
-                        if car_images_urls:
-                            cars.append((row, car_images_urls))
-                            car_vin = row["VIN"]
-                            await methods.add_vins(session, car_id, car_vin)
-                            if len(cars) >= count:
-                                break
-                else:
-                    if await filter_by_make_and_model(row, make, model, year):
-                        car_images_urls = await get_images(row)
-                        if car_images_urls:
-                            cars.append((row, car_images_urls))
-                            car_vin = row["VIN"]
-                            await methods.add_vins(session, car_id, car_vin)
-                            if len(cars) >= count:
-                                break
+    # add_vins коммитит после каждого VIN; открытого курсора здесь нет, так что
+    # коммит посреди перебора ничему не мешает.
+    async for row, car_images_urls in _iter_cars_with_images(
+        session, data, exclude_vins=car_vins
+    ):
+        cars.append((row, car_images_urls))
+        await methods.add_vins(session, car_id, row["VIN"])
+        if len(cars) >= count:
+            break
     return cars[:count]
 
 
@@ -394,14 +332,171 @@ async def subscription_sender(sessionmaker: AsyncSession, bot: Bot):
                     continue
 
 
-# Функция загрузки данных в csv
-async def download_csv(url: str) -> str:
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            filepath = "core/data/csv/salesdata.csv"
-            async with aiofiles.open(filepath, "wb") as f:
-                while chunk := await response.content.read(1024):
-                    await f.write(chunk)
+# Функция проверки файла фида перед тем, как ему поверить
+def validate_snapshot_file(path: Path) -> None:
+    """Check that a file looks like the Copart feed before it is trusted.
+
+    Reads the header and one data row rather than the whole file: an error
+    page, an empty answer or a renamed column all show in the first two lines.
+
+    Args:
+        path: The file to check.
+
+    Raises:
+        FeedDownloadError: When the file is empty, carries no data rows, or
+            lacks a column the bot reads.
+    """
+    with path.open("r", encoding=CSV_ENCODING) as csvfile:
+        reader = csv.reader(csvfile)
+        header = next(reader, None)
+        if not header:
+            raise FeedDownloadError("Copart feed is empty")
+        missing = [name for name in sales_lots.CSV_COLUMNS if name not in header]
+        if missing:
+            raise FeedDownloadError(f"Copart feed lacks columns: {missing}")
+        if next(reader, None) is None:
+            raise FeedDownloadError("Copart feed has no data rows")
+
+
+def _parse_year(row: dict) -> int:
+    # Как прежний фильтр: год через float, нечитаемый — 0, и такой лот не
+    # попадает ни в один диапазон лет.
+    try:
+        return int(float(row["Year"])) if row.get("Year") else 0
+    except (ValueError, TypeError):
+        return 0
+
+
+def _parse_odometer(row: dict) -> float | None:
+    # Нечитаемый пробег раньше ронял весь поиск через float(); теперь такой лот
+    # просто не проходит фильтр по пробегу.
+    try:
+        return float(row["Odometer"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def to_snapshot_record(row: dict) -> tuple:
+    """Turn one CSV row into the tuple the snapshot table is loaded with.
+
+    The CSV text goes in verbatim. The values after it are computed exactly as
+    the old in-Python filter computed them, with the same `normalize_string`,
+    so a search matches the lots it matched before.
+
+    Args:
+        row: One row as csv.DictReader produced it.
+
+    Returns:
+        Values in `sales_lots.COPY_COLUMNS` order.
+    """
+    text = tuple(row.get(name) for name in sales_lots.CSV_COLUMNS)
+    return text + (
+        normalize_string(row.get("Make")),
+        normalize_string(row.get("Model Group")),
+        _parse_year(row),
+        _parse_odometer(row),
+    )
+
+
+def _read_snapshot_batch(reader: Iterator[dict], size: int) -> list:
+    """Parse the next `size` rows. Runs in a worker thread."""
+    return [to_snapshot_record(row) for row in islice(reader, size)]
+
+
+async def _iter_snapshot_batches(reader: Iterator[dict]) -> AsyncIterator[list]:
+    """Yield batches of records, parsing each batch off the event loop."""
+    while True:
+        batch = await asyncio.to_thread(
+            _read_snapshot_batch, reader, SNAPSHOT_BATCH_ROWS
+        )
+        if not batch:
+            return
+        yield batch
+
+
+# Функция загрузки файла фида в снимок в базе
+async def load_snapshot(engine: AsyncEngine, path: Path) -> int:
+    """Replace the snapshot in the database with the contents of this CSV.
+
+    Args:
+        engine: Engine to load through.
+        path: A feed file that already passed `validate_snapshot_file`.
+
+    Returns:
+        How many rows the snapshot now holds.
+    """
+    with path.open("r", encoding=CSV_ENCODING) as csvfile:
+        reader = csv.DictReader(csvfile)
+        async with engine.begin() as conn:
+            loaded = await sales_lots.replace_snapshot(
+                conn, _iter_snapshot_batches(reader)
+            )
+    logger.info("Снимок Copart загружен в базу: %d строк", loaded)
+    return loaded
+
+
+# Функция восстановления снимка из файла, если база пуста
+async def ensure_snapshot_loaded(engine: AsyncEngine) -> None:
+    """Rebuild the snapshot from the feed file when the table is empty.
+
+    The file lives on the csv_data volume and outlives the container, so a
+    restart while Copart is unreachable still leaves customers something to
+    search instead of an empty catalogue until the next download.
+
+    Args:
+        engine: Engine to load through.
+    """
+    async with engine.connect() as conn:
+        if await sales_lots.count_snapshot(conn) > 0:
+            return
+
+    if not CSV_PATH.exists():
+        logger.warning(
+            "Снимок Copart пуст, а файла фида нет: поиск заработает после загрузки"
+        )
+        return
+
+    await asyncio.to_thread(validate_snapshot_file, CSV_PATH)
+    logger.info("Снимок Copart пуст, восстанавливаем из файла на томе")
+    await load_snapshot(engine, CSV_PATH)
+
+
+# Функция загрузки фида Copart и обновления снимка
+async def download_csv(url: str, engine: AsyncEngine) -> None:
+    """Download the Copart feed and make it the current snapshot.
+
+    Written to a temporary file and checked before it replaces anything: an
+    error page or an empty answer must not take the place of a good feed.
+    Customers keep searching the previous snapshot until the new one commits.
+
+    Args:
+        url: Feed URL. It carries the Copart access key, so it never goes into
+            a log line or an exception message.
+        engine: Engine the snapshot is loaded through.
+
+    Raises:
+        FeedDownloadError: When Copart answers with an error or the file is not
+            a usable feed. The previous file and snapshot stay in place.
+    """
+    CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = CSV_PATH.with_name(f"{CSV_PATH.name}.tmp")
+    timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT_SECONDS)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
+                if response.status != HTTP_OK:
+                    message = f"Copart feed answered HTTP {response.status}"
+                    raise FeedDownloadError(message)
+                async with aiofiles.open(tmp_path, "wb") as f:
+                    while chunk := await response.content.read(DOWNLOAD_CHUNK_BYTES):
+                        await f.write(chunk)
+        await asyncio.to_thread(validate_snapshot_file, tmp_path)
+        os.replace(tmp_path, CSV_PATH)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+    await load_snapshot(engine, CSV_PATH)
 
 
 # Функция формирования url для битрикса

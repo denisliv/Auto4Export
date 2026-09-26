@@ -9,7 +9,7 @@ from sqlalchemy.sql import text
 from core.config_data.config import Config, load_config
 from core.db.base import Base
 from core.db.models import (AdminTable, AdviceCarOrder, DamagedCarOrders,
-                            UnbrokenCarOrders, User)
+                            SalesLot, UnbrokenCarOrders, User)
 
 config: Config = load_config()
 admin_ids: list = config.tg_bot.admin_ids
@@ -21,7 +21,8 @@ async def create_db_tables(engine: AsyncEngine):
         await conn.run_sync(Base.metadata.create_all, tables=[AdviceCarOrder.__table__,
                                                               DamagedCarOrders.__table__,
                                                               UnbrokenCarOrders.__table__,
-                                                              User.__table__])
+                                                              User.__table__,
+                                                              SalesLot.__table__])
 
 
 # Функция записи пользователя в БД

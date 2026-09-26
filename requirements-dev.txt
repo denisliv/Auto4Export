@@ -1,0 +1,4 @@
+# Тесты. В продовый образ не ставится: Dockerfile читает только requirements.txt.
+-r requirements.txt
+pytest==8.3.5
+pytest-asyncio==0.24.0
